@@ -50,3 +50,10 @@ logs/
 # Models and Data (optional - remove if you want to track these)
 models/*.keras
 models/*.h5
+
+data/
+models/
+__pycache__/
+*.h5
+*.keras
+.env
