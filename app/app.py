@@ -19,7 +19,10 @@ import base64 as b64lib
 
 from src.gradcam_utils    import (load_and_preprocess_image,
                                    get_gradcam_heatmap,
-                                   create_gradcam_figure)
+                                   create_gradcam_figure,
+                                   detect_tumor_region)
+from src.morphology_analysis import analyze_cell_morphology
+from src.report_generator import generate_medical_report
 from src.batch_processing import BatchAnalyzer, validate_batch_files
 from src.nova_explanation import NovaExplainer
 from src.patient_utils import generate_patient_data, get_patient_display_html
@@ -703,6 +706,8 @@ for k, v in {
     "insight": None,
     "batch_done": False,  # NEW: Batch processing flag
     "batch_result": None,  # NEW: Batch analysis results
+    "pdf_bytes": None,  # NEW: Store generated PDF
+    "pdf_generated": False,  # NEW: Track if PDF was generated
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -880,6 +885,23 @@ def process_image(uploaded_file, file_name: str, model, img_size=(96, 96),
         except Exception as hm_err:
             st.warning(f"⚠ {file_name}: Heatmap generation skipped")
         
+        # Step 4b: Detect tumor region using heatmap
+        tumor_result = None
+        if heatmap is not None:
+            try:
+                tumor_result = detect_tumor_region(pil_img, heatmap, threshold=0.6)
+            except Exception as tumor_err:
+                st.warning(f"⚠ {file_name}: Tumor localization skipped")
+                tumor_result = None
+        
+        # Step 4c: Analyze cell morphology
+        morphology_result = None
+        try:
+            morphology_result = analyze_cell_morphology(pil_img)
+        except Exception as morph_err:
+            st.warning(f"⚠ {file_name}: Cell morphology analysis skipped")
+            morphology_result = None
+        
         # Step 5: Create visualization figure
         figure = None
         if heatmap is not None:
@@ -914,6 +936,8 @@ def process_image(uploaded_file, file_name: str, model, img_size=(96, 96),
             "confidence": float(confidence) if confidence is not None else 0.0,
             "heatmap": heatmap,
             "figure": figure,
+            "tumor_result": tumor_result,  # Tumor localization data
+            "morphology_result": morphology_result,  # Cell morphology analysis data
             "uncertain": bool(uncertain) if uncertain is not None else False,
             "report": str(report) if report else "[No report available]",
             "b64": pil_to_b64(pil_img) if pil_img else None,
@@ -984,6 +1008,8 @@ with col_up:
                             st.session_state.batch_done = True
                             st.session_state.done = False
                             st.session_state.pred = None
+                            st.session_state.pdf_generated = False
+                            st.session_state.pdf_bytes = None
                             st.rerun()
             
             # ── SINGLE MODE: Single image ───────────────────────────────────
@@ -1008,6 +1034,8 @@ with col_up:
                     st.session_state.patient_data = None
                     st.session_state.done = False
                     st.session_state.pred = None
+                    st.session_state.pdf_generated = False
+                    st.session_state.pdf_bytes = None
                 
                 elif validation_result.get('is_warning', False):
                     st.warning(validation_result['message'])
@@ -1018,6 +1046,8 @@ with col_up:
                             st.session_state.done = False
                             st.session_state.pred = None
                             st.session_state.insight = None
+                            st.session_state.pdf_generated = False
+                            st.session_state.pdf_bytes = None
                             st.session_state.chat = [{"role": "assistant", "content": "GradVision system online. Awaiting specimen upload."}]
                         
                         st.session_state.patient_data = generate_patient_data(uploaded_file.name)
@@ -1072,6 +1102,8 @@ with col_up:
                             st.session_state.done = False
                             st.session_state.pred = None
                             st.session_state.insight = None
+                            st.session_state.pdf_generated = False
+                            st.session_state.pdf_bytes = None
                             st.session_state.chat = [{"role": "assistant", "content": "GradVision system online. Awaiting specimen upload."}]
                         
                         st.session_state.patient_data = generate_patient_data(uploaded_file.name)
@@ -1128,6 +1160,8 @@ with col_up:
             st.session_state.patient_data = None
             st.session_state.done = False
             st.session_state.pred = None
+            st.session_state.pdf_generated = False
+            st.session_state.pdf_bytes = None
             st.session_state.insight = None
             st.session_state.chat = [{"role": "assistant", "content": "GradVision system online. Awaiting specimen upload."}]
     else:
@@ -1137,6 +1171,8 @@ with col_up:
         st.session_state.pred = None
         st.session_state.batch_done = False
         st.session_state.batch_result = None
+        st.session_state.pdf_generated = False
+        st.session_state.pdf_bytes = None
         st.session_state.insight = None
         st.session_state.chat = [{"role": "assistant", "content": "GradVision system online. Awaiting specimen upload."}]
         st.markdown("""
@@ -1340,6 +1376,257 @@ if st.session_state.done:
         </div>
         """, unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── TUMOR LOCALIZATION SECTION ──────────────────────────────────────────────
+    # Display three-panel tumor localization visualization
+    if st.session_state.done and st.session_state.pred:
+        r = st.session_state.pred
+        tumor_result = r.get('tumor_result')
+        
+        if tumor_result and isinstance(tumor_result, dict):
+            st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
+            st.markdown('<div class="cv-card">', unsafe_allow_html=True)
+            st.markdown('<div class="section-label">AI Tumor Localization · Region Detection</div>',
+                        unsafe_allow_html=True)
+            
+            if tumor_result.get('has_tumor', False):
+                # Display three images: Original, Heatmap, Localization
+                col_orig, col_heat, col_tumor = st.columns(3)
+                
+                with col_orig:
+                    st.markdown('<div style="text-align:center;"><strong>Original Image</strong></div>',
+                               unsafe_allow_html=True)
+                    st.image(r.get('pil_img'), use_container_width=True)
+                
+                with col_heat:
+                    st.markdown('<div style="text-align:center;"><strong>Grad-CAM Heatmap</strong></div>',
+                               unsafe_allow_html=True)
+                    if tumor_result.get('heatmap_image'):
+                        st.image(tumor_result['heatmap_image'], use_container_width=True)
+                
+                with col_tumor:
+                    st.markdown('<div style="text-align:center;"><strong>Tumor Localization</strong></div>',
+                               unsafe_allow_html=True)
+                    if tumor_result.get('tumor_box_image'):
+                        st.image(tumor_result['tumor_box_image'], use_container_width=True)
+                
+                # Display tumor coordinates
+                coords = tumor_result.get('tumor_coordinates')
+                if coords:
+                    x, y, w, h = coords
+                    st.markdown(f"""
+                    <div style="margin-top:1rem;padding:0.75rem;background:var(--surface-2);border-left:3px solid var(--red);border-radius:var(--radius-sm);">
+                        <div style="font-family:var(--font-mono);font-size:0.65rem;color:var(--red);margin-bottom:0.3rem;letter-spacing:1px;">TUMOR REGION COORDINATES</div>
+                        <div style="font-size:0.9rem;color:var(--text-1);line-height:1.8;">
+                            <strong>Position:</strong> ({x}, {y})<br/>
+                            <strong>Dimensions:</strong> {w} × {h} pixels<br/>
+                            <strong>Area:</strong> {w * h} square pixels
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.markdown("""
+                <div style="padding:1rem;background:var(--amber-dim);border-left:3px solid var(--amber);border-radius:var(--radius-sm);">
+                    <strong style="color:var(--amber);">⚠ No Clear Tumor Region Detected</strong>
+                    <div style="font-size:0.85rem;color:var(--text-2);margin-top:0.5rem;">
+                    The Grad-CAM heatmap did not identify a distinct tumor region using current thresholds.
+                    This may indicate the tissue is benign or the malignancy is diffuse.
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── CELL MORPHOLOGY ANALYSIS SECTION ────────────────────────────────────────
+    # Display cell morphology features and detected nuclei
+    if st.session_state.done and st.session_state.pred:
+        r = st.session_state.pred
+        morphology_result = r.get('morphology_result')
+        
+        if morphology_result and isinstance(morphology_result, dict):
+            st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
+            st.markdown('<div class="cv-card">', unsafe_allow_html=True)
+            st.markdown('<div class="section-label">Cell Morphology Analyzer · Biological Evidence</div>',
+                        unsafe_allow_html=True)
+            
+            if morphology_result.get('cell_count', 0) > 0:
+                # Display metrics in a grid layout
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.markdown(f"""
+                    <div style="padding:0.75rem;background:var(--surface-2);border-radius:var(--radius-sm);border-left:3px solid var(--cyan);">
+                        <div style="font-family:var(--font-mono);font-size:0.65rem;color:var(--cyan);letter-spacing:1px;margin-bottom:0.3rem;">CELLS DETECTED</div>
+                        <div style="font-size:1.8rem;font-weight:600;color:var(--text-1);">{morphology_result.get('cell_count', 0)}</div>
+                        <div style="font-size:0.75rem;color:var(--text-3);margin-top:0.3rem;">nuclei identified</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                with col2:
+                    st.markdown(f"""
+                    <div style="padding:0.75rem;background:var(--surface-2);border-radius:var(--radius-sm);border-left:3px solid var(--magenta);">
+                        <div style="font-family:var(--font-mono);font-size:0.65rem;color:var(--magenta);letter-spacing:1px;margin-bottom:0.3rem;">CELL DENSITY</div>
+                        <div style="font-size:1.8rem;font-weight:600;color:var(--text-1);">{morphology_result.get('cell_density', 0)}</div>
+                        <div style="font-size:0.75rem;color:var(--text-3);margin-top:0.3rem;">cells/million pixels</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                with col3:
+                    irregular_pct = morphology_result.get('irregular_nuclei_ratio', 0) * 100
+                    st.markdown(f"""
+                    <div style="padding:0.75rem;background:var(--surface-2);border-radius:var(--radius-sm);border-left:3px solid var(--orange);">
+                        <div style="font-family:var(--font-mono);font-size:0.65rem;color:var(--orange);letter-spacing:1px;margin-bottom:0.3rem;">IRREGULAR NUCLEI</div>
+                        <div style="font-size:1.8rem;font-weight:600;color:var(--text-1);">{irregular_pct:.1f}%</div>
+                        <div style="font-size:0.75rem;color:var(--text-3);margin-top:0.3rem;">circularity &lt; 0.7</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                # Second row of metrics
+                col4, col5, col6 = st.columns(3)
+                
+                with col4:
+                    st.markdown(f"""
+                    <div style="padding:0.75rem;background:var(--surface-2);border-radius:var(--radius-sm);border-left:3px solid var(--violet);">
+                        <div style="font-family:var(--font-mono);font-size:0.65rem;color:var(--violet);letter-spacing:1px;margin-bottom:0.3rem;">CLUSTER COUNT</div>
+                        <div style="font-size:1.8rem;font-weight:600;color:var(--text-1);">{morphology_result.get('cluster_count', 0)}</div>
+                        <div style="font-size:0.75rem;color:var(--text-3);margin-top:0.3rem;">abnormal groupings</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                with col5:
+                    st.markdown(f"""
+                    <div style="padding:0.75rem;background:var(--surface-2);border-radius:var(--radius-sm);border-left:3px solid var(--indigo);">
+                        <div style="font-family:var(--font-mono);font-size:0.65rem;color:var(--indigo);letter-spacing:1px;margin-bottom:0.3rem;">LARGEST CLUSTER</div>
+                        <div style="font-size:1.8rem;font-weight:600;color:var(--text-1);">{morphology_result.get('largest_cluster', 0)}</div>
+                        <div style="font-size:0.75rem;color:var(--text-3);margin-top:0.3rem;">cells per group</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                with col6:
+                    suspicion = morphology_result.get('suspicion_level', 'Unknown')
+                    # Color code by suspicion level
+                    if suspicion == 'High':
+                        sus_color = 'var(--red)'
+                    elif suspicion == 'Moderate':
+                        sus_color = 'var(--amber)'
+                    else:
+                        sus_color = 'var(--green)'
+                    
+                    st.markdown(f"""
+                    <div style="padding:0.75rem;background:var(--surface-2);border-radius:var(--radius-sm);border-left:3px solid {sus_color};">
+                        <div style="font-family:var(--font-mono);font-size:0.65rem;color:{sus_color};letter-spacing:1px;margin-bottom:0.3rem;">MORPHOLOGY SUSPICION</div>
+                        <div style="font-size:1.8rem;font-weight:600;color:{sus_color};">{suspicion}</div>
+                        <div style="font-size:0.75rem;color:var(--text-3);margin-top:0.3rem;">biological evidence</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                # Display annotated morphology image
+                st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
+                st.markdown('<div style="text-align:center;"><strong>Detected Cell Nuclei · Annotated Image</strong></div>',
+                           unsafe_allow_html=True)
+                if morphology_result.get('annotated_image'):
+                    st.image(morphology_result['annotated_image'], use_container_width=True)
+                    st.markdown("""
+                    <div style="font-size:0.75rem;color:var(--text-3);text-align:center;margin-top:0.5rem;margin-bottom:0.5rem;">
+                    <span style="color:var(--green);">● Green contours</span> = regular nuclei · 
+                    <span style="color:var(--red);">● Red contours</span> = irregular nuclei
+                    </div>
+                    """, unsafe_allow_html=True)
+            
+            else:
+                st.markdown("""
+                <div style="padding:1rem;background:var(--amber-dim);border-left:3px solid var(--amber);border-radius:var(--radius-sm);">
+                    <strong style="color:var(--amber);">⚠ Cell Analysis Incomplete</strong>
+                    <div style="font-size:0.85rem;color:var(--text-2);margin-top:0.5rem;">
+                    No nuclei detected in the image. Morphology analysis could not be completed.
+                    This may indicate extremely benign tissue or image quality issues.
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── AI PATHOLOGY REPORT SECTION ─────────────────────────────────────────────
+    # Generate professional medical report with PDF download
+    if st.session_state.done and st.session_state.pred:
+        r = st.session_state.pred
+        
+        # Only show report generation if we have successful prediction
+        if r.get('status') == 'success':
+            st.markdown("<div style='height:0.4rem'></div>", unsafe_allow_html=True)
+            st.markdown('<div class="cv-card">', unsafe_allow_html=True)
+            st.markdown('<div class="section-label">AI Pathology Report · Clinical Documentation</div>',
+                        unsafe_allow_html=True)
+            
+            st.markdown("""
+            <div style="padding:0.75rem;background:var(--surface-2);border-left:3px solid var(--green);border-radius:var(--radius-sm);margin-bottom:1rem;">
+                <div style="font-size:0.85rem;color:var(--text-1);line-height:1.6;">
+                Generate a professional pathology-style medical report summarizing all analysis results.
+                The report includes AI prediction, morphology findings, and clinical recommendations.
+                <strong>Important:</strong> This is an AI-assisted report for clinical decision support only.
+                Final diagnosis must be confirmed by a qualified pathologist.
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Report generation button
+            col_gen, col_space = st.columns([1, 3])
+            
+            with col_gen:
+                if st.button("📄 Generate Medical Report", use_container_width=True, key="gen_report_btn"):
+                    with st.spinner("🔄 Generating professional report..."):
+                        # Prepare data for report generation
+                        report_data = {
+                            'prediction': r.get('label', 'Unknown'),
+                            'confidence': r.get('confidence', 0.0),
+                            'cell_count': 0,
+                            'cell_density': 0.0,
+                            'irregular_nuclei_ratio': 0.0,
+                            'cluster_count': 0,
+                            'largest_cluster': 0,
+                            'suspicion_level': 'Unknown',
+                            'image_name': r.get('image_name', 'Specimen')
+                        }
+                        
+                        # Add morphology data if available
+                        morph = r.get('morphology_result')
+                        if morph and isinstance(morph, dict):
+                            report_data['cell_count'] = morph.get('cell_count', 0)
+                            report_data['cell_density'] = morph.get('cell_density', 0.0)
+                            report_data['irregular_nuclei_ratio'] = morph.get('irregular_nuclei_ratio', 0.0)
+                            report_data['cluster_count'] = morph.get('cluster_count', 0)
+                            report_data['largest_cluster'] = morph.get('largest_cluster', 0)
+                            report_data['suspicion_level'] = morph.get('suspicion_level', 'Unknown')
+                        
+                        # Generate PDF
+                        pdf_bytes, status_msg = generate_medical_report(
+                            report_data,
+                            heatmap_img=r.get('figure'),  # GradCAM visualization
+                            tumor_img=r.get('tumor_result', {}).get('tumor_box_image') if r.get('tumor_result') else None
+                        )
+                        
+                        if pdf_bytes:
+                            st.session_state.pdf_bytes = pdf_bytes
+                            st.session_state.pdf_generated = True
+                            st.success(status_msg)
+                        else:
+                            st.error(status_msg)
+            
+            # Download button (show only if PDF was generated)
+            if st.session_state.get('pdf_generated', False) and st.session_state.get('pdf_bytes'):
+                st.markdown("<div style='height:0.2rem'></div>", unsafe_allow_html=True)
+                col_down, col_space2 = st.columns([1, 3])
+                
+                with col_down:
+                    st.download_button(
+                        label="⬇️ Download AI Pathology Report (PDF)",
+                        data=st.session_state.pdf_bytes,
+                        file_name=f"AI_Pathology_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True
+                    )
+            
+            st.markdown('</div>', unsafe_allow_html=True)
 
     # Tab 2 — Morphological Deep-Dive
     with tab2:

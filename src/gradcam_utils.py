@@ -261,3 +261,116 @@ def create_superimposed_img(heatmap, pil_img, alpha=0.4):
         "heatmap_only": hm_colored,
         "side_by_side": np.concatenate([orig, overlay], axis=1)
     }
+
+def detect_tumor_region(original_pil_img, heatmap, threshold=0.6, min_area=50):
+    """
+    Detect tumor region from Grad-CAM heatmap using contour detection.
+    
+    Args:
+        original_pil_img: PIL Image of original specimen
+        heatmap: Raw heatmap from Grad-CAM (0-1 normalized float32)
+        threshold: Threshold for binarization (0.0-1.0, default 0.6)
+        min_area: Minimum area to consider as tumor (default 50 pixels)
+    
+    Returns:
+        dict with:
+            - "heatmap_image": PIL Image of heatmap overlay
+            - "tumor_box_image": PIL Image with bounding box drawn
+            - "tumor_coordinates": tuple (x, y, w, h) or None if no tumor found
+            - "has_tumor": bool indicating if tumor region was detected
+    """
+    try:
+        # Convert PIL to numpy
+        orig = np.array(original_pil_img.convert("RGB"))
+        orig_h, orig_w = orig.shape[:2]
+        
+        # Normalize heatmap to 0-1 range
+        if heatmap.max() > 1e-8:
+            hm_norm = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min())
+        else:
+            hm_norm = heatmap
+        
+        # Resize heatmap to original image size
+        hm_resized = cv2.resize(hm_norm, (orig_w, orig_h))
+        
+        # Convert to 0-255 range
+        hm_uint8 = np.uint8(255 * np.maximum(hm_resized, 0))
+        
+        # Apply threshold to create binary mask
+        _, binary_mask = cv2.threshold(hm_uint8, int(255 * threshold), 255, cv2.THRESH_BINARY)
+        
+        # Morphological operations to clean up mask
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
+        binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel)
+        
+        # Find contours
+        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Filter contours by area and find largest
+        tumor_bbox = None
+        largest_contour = None
+        max_area = 0
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > min_area and area > max_area:
+                max_area = area
+                largest_contour = contour
+        
+        # Create colored heatmap overlay
+        hm_colored = cv2.applyColorMap(hm_uint8, cv2.COLORMAP_JET)
+        hm_colored = cv2.cvtColor(hm_colored, cv2.COLOR_BGR2RGB)
+        
+        # Create superimposed image for visualization
+        heatmap_overlay = cv2.addWeighted(
+            orig.astype(np.float32), 0.6,
+            hm_colored.astype(np.float32), 0.4,
+            0
+        ).astype(np.uint8)
+        
+        # Draw bounding box on a copy of original image
+        tumor_box_img = orig.copy()
+        has_tumor = False
+        
+        if largest_contour is not None:
+            # Get bounding rectangle
+            x, y, w, h = cv2.boundingRect(largest_contour)
+            tumor_bbox = (x, y, w, h)
+            
+            # Draw bounding box (red rectangle)
+            cv2.rectangle(tumor_box_img, (x, y), (x + w, y + h), (255, 0, 0), 3)
+            
+            # Draw contour (optional, green for visibility)
+            cv2.drawContours(tumor_box_img, [largest_contour], 0, (0, 255, 0), 2)
+            
+            # Add label with tumor location
+            cv2.putText(tumor_box_img, f"Tumor Region: ({x},{y}) {w}x{h}",
+                       (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+            
+            has_tumor = True
+        
+        # Convert numpy arrays to PIL Images
+        heatmap_pil = Image.fromarray(heatmap_overlay)
+        tumor_box_pil = Image.fromarray(tumor_box_img)
+        
+        return {
+            "heatmap_image": heatmap_pil,
+            "tumor_box_image": tumor_box_pil,
+            "tumor_coordinates": tumor_bbox,
+            "has_tumor": has_tumor,
+            "largest_area": max_area,
+            "binary_mask": binary_mask
+        }
+    
+    except Exception as e:
+        # Return safe default on error
+        return {
+            "heatmap_image": Image.fromarray(np.array(original_pil_img)),
+            "tumor_box_image": Image.fromarray(np.array(original_pil_img)),
+            "tumor_coordinates": None,
+            "has_tumor": False,
+            "largest_area": 0,
+            "binary_mask": None,
+            "error": str(e)
+        }
