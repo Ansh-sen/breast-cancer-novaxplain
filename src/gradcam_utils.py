@@ -113,27 +113,53 @@ def get_gradcam_heatmap(img_array, model,
 
 def create_gradcam_figure(heatmap, pil_img, label, confidence,
                           uncertain=False, target_size=None):
+    """
+    Create improved Grad-CAM visualization figure with three panels.
+    
+    Panel 1: Original image
+    Panel 2: Prediction label with confidence
+    Panel 3: JET heatmap overlay showing important regions
+    """
     if target_size is None:
         target_size = (96, 96)
     W, H    = target_size
     orig    = cv2.resize(np.array(pil_img.convert("RGB")), (W, H))
     hm_disp = cv2.resize(heatmap, (W, H))
-    # Use HOT colormap for IDC: Black (benign) -> Red/Orange (malignancy) -> Yellow (high activation)
-    # Aligns perfectly with H&E brown staining of malignant tumor cells
-    hot_map = cv2.cvtColor(
-                  cv2.applyColorMap(np.uint8(255 * hm_disp), cv2.COLORMAP_HOT),
-                  cv2.COLOR_BGR2RGB)
-    py, px  = np.unravel_index(np.argmax(hm_disp), hm_disp.shape)
+    
+    # Normalize and apply ReLU to heatmap
+    hm_norm = np.maximum(hm_disp, 0)
+    hm_max = hm_norm.max()
+    if hm_max > 1e-10:
+        hm_norm = hm_norm / hm_max
+    else:
+        hm_norm = np.zeros_like(hm_norm)
+    
+    # Apply JET colormap with proper normalization
+    hm_uint8 = np.uint8(255 * hm_norm)
+    jet_map = cv2.applyColorMap(hm_uint8, cv2.COLORMAP_JET)
+    jet_map = cv2.cvtColor(jet_map, cv2.COLOR_BGR2RGB)
+    
+    # Create overlay with 40% transparency
+    overlay_img = cv2.addWeighted(
+        orig.astype(np.float32), 0.6,
+        jet_map.astype(np.float32), 0.4,
+        0
+    ).astype(np.uint8)
+    
+    # Find peak activation location for ROI circle
+    py, px  = np.unravel_index(np.argmax(hm_norm), hm_norm.shape)
     cr      = max(W, H) // 8
     lc      = "#f43f5e" if label == "MALIGNANT" else "#10b981"
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     fig.patch.set_facecolor("#0b0f1a")
 
+    # Panel 1: Original
     axes[0].imshow(orig)
     axes[0].set_title("Original Image", color="white",
                       fontsize=11, fontweight="bold", pad=8)
 
+    # Panel 2: Prediction
     axes[1].imshow(orig)
     axes[1].set_title(f"Predicted: {label}" + ("  \u26a0\ufe0f" if uncertain else ""),
                       color=lc, fontsize=11, fontweight="bold", pad=8)
@@ -143,10 +169,11 @@ def create_gradcam_figure(heatmap, pil_img, label, confidence,
                  bbox=dict(boxstyle="round,pad=0.3", facecolor="black",
                            alpha=0.8, edgecolor=lc))
 
-    axes[2].imshow(hot_map)
-    axes[2].set_title("Grad-CAM Heatmap (HOT: Black→Red→Yellow for IDC)", color="white",
+    # Panel 3: JET Heatmap with overlay
+    axes[2].imshow(overlay_img)
+    axes[2].set_title("Grad-CAM Heatmap (JET: Blue→Green→Yellow→Red)", color="white",
                       fontsize=11, fontweight="bold", pad=8)
-    # Add ROI marker circle
+    # Mark peak activation region with circle
     circ_color = "yellow" if label == "MALIGNANT" else "cyan"
     axes[2].add_patch(patches.Circle((px, py), radius=cr, linewidth=3,
                       edgecolor=circ_color, facecolor="none", zorder=5, linestyle='--'))
@@ -164,17 +191,73 @@ def create_gradcam_figure(heatmap, pil_img, label, confidence,
     return Image.open(buf).copy()
 
 
-def create_superimposed_img(heatmap, pil_img, alpha=0.45):
+def create_improved_gradcam_heatmap(heatmap, original_size=None):
+    """
+    Improve Grad-CAM heatmap visualization:
+    - Normalize values correctly (0-1 range)
+    - Apply ReLU activation  
+    - Use JET colormap
+    - Proper alpha blending
+    
+    Returns: Normalized heatmap [0, 255] uint8 for JET colormap
+    """
+    # Ensure heatmap is float32
+    hm = heatmap.astype(np.float32)
+    
+    # Step 1: Apply ReLU (keep only positive activations)
+    hm = np.maximum(hm, 0)
+    
+    # Step 2: Normalize to [0, 1]
+    hm_max = hm.max()
+    if hm_max > 1e-10:
+        hm = hm / hm_max
+    else:
+        # If heatmap is empty, return zeros
+        return np.zeros_like(hm, dtype=np.uint8)
+    
+    # Step 3: Convert to uint8 for cv2.applyColorMap
+    hm_uint8 = np.uint8(255 * hm)
+    
+    # Step 4: Apply JET colormap (blue=low, red=high activation)
+    hm_colored = cv2.applyColorMap(hm_uint8, cv2.COLORMAP_JET)
+    # Convert from BGR to RGB
+    hm_colored = cv2.cvtColor(hm_colored, cv2.COLOR_BGR2RGB)
+    
+    return hm_colored
+
+
+def create_superimposed_img(heatmap, pil_img, alpha=0.4):
+    """
+    Create superimposed image with improved heatmap overlay.
+    
+    Args:
+        heatmap: Raw heatmap from Grad-CAM (0-1 normalized)
+        pil_img: PIL Image of original specimen
+        alpha: Transparency of heatmap overlay (0.4 default)
+    
+    Returns:
+        dict with overlay and original images
+    """
     orig = np.array(pil_img.convert("RGB"))
     h, w = orig.shape[:2]
-    rsz  = cv2.resize(heatmap, (w, h)) if heatmap.max() > 1e-8 \
-           else np.zeros((h, w), dtype=np.float32)
-    # Use HOT colormap for IDC visualization: aligns with H&E brown staining
-    hot_overlay  = cv2.cvtColor(
-               cv2.applyColorMap(np.uint8(255 * rsz), cv2.COLORMAP_HOT),
-               cv2.COLOR_BGR2RGB)
-    ov   = np.clip(cv2.addWeighted(orig.astype(np.float32), 1 - alpha,
-                                    hot_overlay.astype(np.float32),  alpha, 0),
-                   0, 255).astype(np.uint8)
-    return {"overlay": ov, "heatmap_only": inferno,
-            "side_by_side": np.concatenate([orig, ov], axis=1)}
+    
+    # Resize heatmap to original image size
+    rsz = cv2.resize(heatmap, (w, h)) if heatmap.max() > 1e-8 \
+          else np.zeros((h, w), dtype=np.float32)
+    
+    # Get improved colored heatmap using JET colormap
+    hm_colored = create_improved_gradcam_heatmap(rsz)
+    
+    # Overlay with transparency
+    overlay = cv2.addWeighted(
+        orig.astype(np.float32), 1 - alpha,
+        hm_colored.astype(np.float32), alpha,
+        0
+    )
+    overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+    
+    return {
+        "overlay": overlay,
+        "heatmap_only": hm_colored,
+        "side_by_side": np.concatenate([orig, overlay], axis=1)
+    }

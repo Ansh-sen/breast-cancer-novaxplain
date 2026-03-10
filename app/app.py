@@ -20,6 +20,7 @@ import base64 as b64lib
 from src.gradcam_utils    import (load_and_preprocess_image,
                                    get_gradcam_heatmap,
                                    create_gradcam_figure)
+from src.batch_processing import BatchAnalyzer, validate_batch_files
 from src.nova_explanation import NovaExplainer
 from src.patient_utils import generate_patient_data, get_patient_display_html
 from src.image_validator import validate_histopathology_image
@@ -700,6 +701,8 @@ for k, v in {
     "chat": [{"role": "assistant",
               "content": "GradVision system online. Awaiting specimen upload."}],
     "insight": None,
+    "batch_done": False,  # NEW: Batch processing flag
+    "batch_result": None,  # NEW: Batch analysis results
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -814,6 +817,116 @@ with st.sidebar:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+# ── UNIFIED IMAGE PROCESSING FUNCTION ──────────────────────────────────────
+def process_image(uploaded_file, file_name: str, model, img_size=(96, 96), 
+                   threshold=0.50, nova_explainer=None) -> dict:
+    """
+    Unified image processing function for both single and batch modes.
+    
+    Args:
+        uploaded_file: Streamlit uploaded file object
+        file_name: Display name of the file
+        model: Loaded TensorFlow model
+        img_size: Target image size (default 96x96)
+        threshold: Classification threshold (default 0.50)
+        nova_explainer: NovaExplainer instance for report generation
+    
+    Returns:
+        dict with complete prediction and visualization, or None if processing fails.
+        
+        Success format:
+        {
+            "image_name": str,
+            "pil_img": PIL.Image,
+            "img_array": np.ndarray,
+            "raw_pred": float,
+            "label": str,
+            "confidence": float,
+            "heatmap": np.ndarray,
+            "figure": PIL.Image,
+            "uncertain": bool,
+            "report": str,
+            "b64": str,
+            "is_malignant": bool,
+            "status": "success"
+        }
+    """
+    try:
+        # Step 1: Load and preprocess image
+        try:
+            img_array, pil_img = load_and_preprocess_image(uploaded_file, img_size, model)
+            if img_array is None or pil_img is None:
+                return None
+        except Exception as load_err:
+            st.warning(f"❌ {file_name}: Image loading failed - {str(load_err)[:50]}")
+            return None
+        
+        # Step 2: Generate prediction
+        try:
+            raw_pred = float(model.predict(img_array, verbose=0)[0][0])
+        except Exception as pred_err:
+            st.warning(f"❌ {file_name}: Model prediction failed - {str(pred_err)[:50]}")
+            return None
+        
+        # Step 3: Calculate classification and confidence
+        uncertain = 0.40 < raw_pred < 0.60
+        label = "MALIGNANT" if raw_pred > threshold else "BENIGN"
+        confidence = raw_pred if label == "MALIGNANT" else 1.0 - raw_pred
+        
+        # Step 4: Generate Grad-CAM heatmap
+        heatmap = None
+        try:
+            heatmap = get_gradcam_heatmap(img_array, model)
+        except Exception as hm_err:
+            st.warning(f"⚠ {file_name}: Heatmap generation skipped")
+        
+        # Step 5: Create visualization figure
+        figure = None
+        if heatmap is not None:
+            try:
+                figure = create_gradcam_figure(
+                    heatmap, pil_img, label, confidence, uncertain, img_size)
+            except Exception as fig_err:
+                st.warning(f"⚠ {file_name}: Visualization creation skipped")
+        
+        # Step 6: Generate clinical report
+        report = None
+        if nova_explainer is not None:
+            try:
+                report = nova_explainer.generate_explanation(
+                    pil_img, label, confidence, uncertain)
+            except Exception as report_err:
+                report = "[Report generation unavailable]"
+        else:
+            report = "[Report generation unavailable]"
+        
+        # Ensure report is string
+        if report is None or not isinstance(report, str):
+            report = "[Report generation unavailable]"
+        
+        # Step 7: Return complete prediction dictionary
+        return {
+            "image_name": file_name,
+            "pil_img": pil_img,
+            "img_array": img_array,
+            "raw_pred": float(raw_pred) if raw_pred is not None else 0.0,
+            "label": str(label) if label else "UNKNOWN",
+            "confidence": float(confidence) if confidence is not None else 0.0,
+            "heatmap": heatmap,
+            "figure": figure,
+            "uncertain": bool(uncertain) if uncertain is not None else False,
+            "report": str(report) if report else "[No report available]",
+            "b64": pil_to_b64(pil_img) if pil_img else None,
+            "is_malignant": label == "MALIGNANT" if label else False,
+            "status": "success"
+        }
+    
+    except Exception as outer_err:
+        # Catch-all for unexpected errors
+        st.warning(f"❌ {file_name}: Processing failed - {str(outer_err)[:50]}")
+        return None
+
+
 # ── HEADER ─────────────────────────────────────────────────────────────────────
 st.markdown(f"""
 <div style="display:flex;align-items:center;justify-content:space-between;
@@ -834,7 +947,8 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 
-# ── TOP ROW: Upload + Result ───────────────────────────────────────────────────
+# ── UNIFIED UPLOAD SECTION ─────────────────────────────────────────────────────
+# Supports both single image and batch processing (1 or multiple images)
 col_up, col_res = st.columns([1, 1.4], gap="large")
 
 with col_up:
@@ -842,132 +956,189 @@ with col_up:
     st.markdown('<div class="section-label">📥 Specimen Import</div>',
                 unsafe_allow_html=True)
 
-    uploaded_file = st.file_uploader(
-        "Drop histopathology image", type=["jpg","jpeg","png","tif"],
+    # Unified file uploader - accepts 1 to multiple images
+    uploaded_files = st.file_uploader(
+        "Drop histopathology images (1 or multiple)",
+        type=["jpg","jpeg","png","tif"],
+        accept_multiple_files=True,
         label_visibility="collapsed")
 
-    if uploaded_file:
+    # Determine processing mode based on number of files
+    is_batch_mode = len(uploaded_files) > 1
+    
+    if uploaded_files:
         try:
-            img_array, pil_img = load_and_preprocess_image(uploaded_file, IMG_SIZE)
+            # ── BATCH MODE: Multiple images ─────────────────────────────────
+            if is_batch_mode:
+                # Validate batch (2-10 images)
+                is_valid, msg = validate_batch_files(uploaded_files)
+                if not is_valid:
+                    st.error(f"⚠ {msg}")
+                else:
+                    st.success(f"✓ {len(uploaded_files)} images ready for analysis")
+                    if st.button("▶  ANALYZE BATCH", key="analyze_batch_unified"):
+                        with st.spinner(f"Analyzing {len(uploaded_files)} specimens…"):
+                            analyzer = BatchAnalyzer(model, IMG_SIZE, threshold)
+                            batch_result = analyzer.analyze_batch(uploaded_files)
+                            st.session_state.batch_result = batch_result
+                            st.session_state.batch_done = True
+                            st.session_state.done = False
+                            st.session_state.pred = None
+                            st.rerun()
             
-            # Validate that image is histopathology (H&E stained tissue)
-            validation_result = validate_histopathology_image(pil_img)
-            
-            # Check if this is a NEW image (different from previous upload)
-            is_new_image = st.session_state.image_uploaded != uploaded_file.name
-            
-            if not validation_result['is_valid']:
-                # Rejected - show error and clear
-                st.error(validation_result['message'])
-                st.session_state.patient_data = None
-                st.session_state.done = False
-                st.session_state.pred = None
-                st.session_state.insight = None
-                st.session_state.chat = [{"role": "assistant", "content": "GradVision system online. Awaiting specimen upload."}]
-                img_array = None
-                pil_img = None
-                uploaded_file = None
-            elif validation_result['is_warning']:
-                # Warning - show warning but allow to proceed
-                st.warning(validation_result['message'])
-                
-                # Generate synthetic patient data for this specimen (only once per upload)
-                if st.session_state.patient_data is None or is_new_image:
-                    # NEW IMAGE: Reset old results
-                    if is_new_image:
-                        st.session_state.done = False
-                        st.session_state.pred = None
-                        st.session_state.insight = None
-                        st.session_state.chat = [{"role": "assistant", "content": "GradVision system online. Awaiting specimen upload."}]
-                    
-                    st.session_state.patient_data = generate_patient_data(uploaded_file.name)
-                    st.session_state.image_uploaded = uploaded_file.name
-                    st.info("✓ Patient context generated and loaded in sidebar (⚠️ Low confidence mode)")
+            # ── SINGLE MODE: Single image ───────────────────────────────────
             else:
-                # Valid - proceed normally
-                # Generate synthetic patient data for this specimen (only once per upload)
-                if st.session_state.patient_data is None or is_new_image:
-                    # NEW IMAGE: Reset old results
-                    if is_new_image:
-                        st.session_state.done = False
-                        st.session_state.pred = None
-                        st.session_state.insight = None
-                        st.session_state.chat = [{"role": "assistant", "content": "GradVision system online. Awaiting specimen upload."}]
+                uploaded_file = uploaded_files[0]
+                
+                # Load image for validation
+                try:
+                    img_array_temp, pil_img_temp = load_and_preprocess_image(uploaded_file, IMG_SIZE)
+                except:
+                    img_array_temp = None
+                    pil_img_temp = None
+                
+                # Validate that image is histopathology
+                validation_result = validate_histopathology_image(pil_img_temp) if pil_img_temp else {'is_valid': False, 'message': 'Failed to load image'}
+                
+                # Check if this is a NEW image
+                is_new_image = st.session_state.image_uploaded != uploaded_file.name
+                
+                if not validation_result['is_valid']:
+                    st.error(validation_result['message'])
+                    st.session_state.patient_data = None
+                    st.session_state.done = False
+                    st.session_state.pred = None
+                
+                elif validation_result.get('is_warning', False):
+                    st.warning(validation_result['message'])
                     
-                    st.session_state.patient_data = generate_patient_data(uploaded_file.name)
-                    st.session_state.image_uploaded = uploaded_file.name
-                    st.success("✓ Patient context generated and loaded in sidebar")
+                    # Generate patient data
+                    if st.session_state.patient_data is None or is_new_image:
+                        if is_new_image:
+                            st.session_state.done = False
+                            st.session_state.pred = None
+                            st.session_state.insight = None
+                            st.session_state.chat = [{"role": "assistant", "content": "GradVision system online. Awaiting specimen upload."}]
+                        
+                        st.session_state.patient_data = generate_patient_data(uploaded_file.name)
+                        st.session_state.image_uploaded = uploaded_file.name
+                        st.info("✓ Patient context generated (⚠️ Low confidence mode)")
+                    
+                    # Show image
+                    st.markdown(f"""
+                    <div class="meta-strip">
+                        <div class="meta-item">ID: <span>PT-2024-08863</span></div>
+                        <div class="meta-item">Stain: <span>H&E</span></div>
+                        <div class="meta-item">Mag: <span>40×</span></div>
+                        <div class="meta-item">Res: <span>96×96</span></div>
+                        <div class="meta-item">Model: <span>MobileNetV2</span></div>
+                        <div class="meta-live">● LIVE</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.markdown('<div class="img-frame scan-wrap">', unsafe_allow_html=True)
+                    st.image(pil_img_temp, use_container_width=True)
+                    st.markdown('</div>', unsafe_allow_html=True)
+                    st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
+                    
+                    if st.button("▶  START DIAGNOSTIC SCAN", key="scan_warning"):
+                        with st.spinner("Processing specimen…"):
+                            result = process_image(uploaded_file, uploaded_file.name, model, 
+                                                 IMG_SIZE, threshold, nova)
+                            if result is not None and isinstance(result, dict):
+                                st.session_state.pred = result
+                                st.session_state.done = True
+                                st.session_state.batch_done = False
+                                st.session_state.batch_result = None
+                                st.session_state.insight = None
+                                st.session_state.chat = [{
+                                    "role": "assistant",
+                                    "content": (
+                                        f"Analysis complete. Specimen classified as **{result.get('label', 'UNKNOWN')}** "
+                                        f"({result.get('confidence', 0)*100:.1f}% confidence)."
+                                        + (" ⚠️ Borderline — expert review recommended."
+                                           if result.get('uncertain', False) else "")
+                                    )
+                                }]
+                                st.rerun()
+                            else:
+                                st.warning("⚠️ Could not process image. Try a different specimen.")
+                                st.session_state.done = False
+                                st.session_state.pred = None
+                
+                else:
+                    # Valid image
+                    if st.session_state.patient_data is None or is_new_image:
+                        if is_new_image:
+                            st.session_state.done = False
+                            st.session_state.pred = None
+                            st.session_state.insight = None
+                            st.session_state.chat = [{"role": "assistant", "content": "GradVision system online. Awaiting specimen upload."}]
+                        
+                        st.session_state.patient_data = generate_patient_data(uploaded_file.name)
+                        st.session_state.image_uploaded = uploaded_file.name
+                        st.success("✓ Patient context loaded")
+                    
+                    # Show image
+                    st.markdown(f"""
+                    <div class="meta-strip">
+                        <div class="meta-item">ID: <span>PT-2024-08863</span></div>
+                        <div class="meta-item">Stain: <span>H&E</span></div>
+                        <div class="meta-item">Mag: <span>40×</span></div>
+                        <div class="meta-item">Res: <span>96×96</span></div>
+                        <div class="meta-item">Model: <span>MobileNetV2</span></div>
+                        <div class="meta-live">● LIVE</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.markdown('<div class="img-frame scan-wrap">', unsafe_allow_html=True)
+                    st.image(pil_img_temp, use_container_width=True)
+                    st.markdown('</div>', unsafe_allow_html=True)
+                    st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
+
+                    if st.button("▶  START DIAGNOSTIC SCAN"):
+                        with st.spinner("Processing specimen…"):
+                            result = process_image(uploaded_file, uploaded_file.name, model, 
+                                                 IMG_SIZE, threshold, nova)
+                            if result is not None and isinstance(result, dict):
+                                st.session_state.pred = result
+                                st.session_state.done = True
+                                st.session_state.batch_done = False
+                                st.session_state.batch_result = None
+                                st.session_state.insight = None
+                                st.session_state.chat = [{
+                                    "role": "assistant",
+                                    "content": (
+                                        f"Analysis complete. Specimen classified as **{result.get('label', 'UNKNOWN')}** "
+                                        f"({result.get('confidence', 0)*100:.1f}% confidence)."
+                                        + (" ⚠️ Borderline — expert review recommended."
+                                           if result.get('uncertain', False) else "")
+                                    )
+                                }]
+                                st.rerun()
+                            else:
+                                st.warning("⚠️ Could not process image. Try a different specimen.")
+                                st.session_state.done = False
+                                st.session_state.pred = None
+            
+            st.markdown('</div>', unsafe_allow_html=True)
         
         except Exception as e:
-            st.error(f"[ERROR] Failed to load image: {str(e)[:100]}")
+            st.error(f"Image processing failed: {str(e)[:100]}")
+            st.warning("⚠️ Please try uploading a different image.")
+            # Don't stop execution - let other sections render
             st.session_state.patient_data = None
             st.session_state.done = False
             st.session_state.pred = None
             st.session_state.insight = None
             st.session_state.chat = [{"role": "assistant", "content": "GradVision system online. Awaiting specimen upload."}]
-            img_array = None
-            pil_img = None
     else:
-        # No image uploaded - clear patient data and results
+        # No images uploaded - clear all state
         st.session_state.patient_data = None
         st.session_state.done = False
         st.session_state.pred = None
+        st.session_state.batch_done = False
+        st.session_state.batch_result = None
         st.session_state.insight = None
         st.session_state.chat = [{"role": "assistant", "content": "GradVision system online. Awaiting specimen upload."}]
-        img_array = None
-        pil_img = None
-
-    if uploaded_file and img_array is not None:
-        # Metadata strip
-        st.markdown(f"""
-        <div class="meta-strip">
-            <div class="meta-item">ID: <span>PT-2024-08863</span></div>
-            <div class="meta-item">Stain: <span>H&E</span></div>
-            <div class="meta-item">Mag: <span>40×</span></div>
-            <div class="meta-item">Res: <span>96×96</span></div>
-            <div class="meta-item">Model: <span>MobileNetV2</span></div>
-            <div class="meta-live">● LIVE</div>
-        </div>
-        """, unsafe_allow_html=True)
-        st.markdown('<div class="img-frame scan-wrap">', unsafe_allow_html=True)
-        st.image(pil_img, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
-
-        if st.button("▶  START DIAGNOSTIC SCAN"):
-            with st.spinner("Neural network processing specimen…"):
-                raw_pred   = float(model.predict(img_array, verbose=0)[0][0])
-                uncertain  = 0.40 < raw_pred < 0.60
-                label      = "MALIGNANT" if raw_pred > threshold else "BENIGN"
-                confidence = raw_pred if label == "MALIGNANT" else 1.0 - raw_pred
-
-                heatmap = get_gradcam_heatmap(img_array, model)
-                figure  = create_gradcam_figure(
-                    heatmap, pil_img, label, confidence, uncertain, IMG_SIZE)
-                report  = nova.generate_explanation(
-                    pil_img, label, confidence, uncertain)
-
-                st.session_state.pred = {
-                    "label": label, "confidence": confidence,
-                    "raw_pred": raw_pred, "uncertain": uncertain,
-                    "report": report, "pil_img": pil_img,
-                    "figure": figure, "b64": pil_to_b64(pil_img),
-                    "is_malignant": label == "MALIGNANT",
-                }
-                st.session_state.done    = True
-                st.session_state.insight = None
-                st.session_state.chat    = [{
-                    "role": "assistant",
-                    "content": (
-                        f"Analysis complete. Specimen classified as **{label}** "
-                        f"({confidence*100:.1f}% confidence)."
-                        + (" ⚠️ Borderline — expert review recommended."
-                           if uncertain else "")
-                    )
-                }]
-                st.rerun()
-    else:
         st.markdown("""
         <div style="height:300px;display:flex;flex-direction:column;
              justify-content:center;align-items:center;
@@ -975,17 +1146,16 @@ with col_up:
              background:var(--surface-2);">
             <div style="font-size:2.5rem;margin-bottom:0.75rem;opacity:0.3;">🔬</div>
             <div style="font-weight:600;color:var(--text-3);font-size:0.9rem;">
-                Drop specimen image</div>
+                Drop specimen image(s)</div>
             <div style="font-family:var(--font-mono);font-size:0.62rem;
                  color:var(--text-3);margin-top:0.3rem;">
-                JPG · PNG · TIF · 224×224 input</div>
+                Single image or batch (2-10) · JPG · PNG · TIF</div>
         </div>""", unsafe_allow_html=True)
-
-    st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
 
 with col_res:
-    if not st.session_state.done:
+    if not st.session_state.done and not st.session_state.batch_done:
         st.markdown("""
         <div class="cv-card" style="min-height:400px;display:flex;
              flex-direction:column;justify-content:center;align-items:center;">
@@ -997,28 +1167,145 @@ with col_res:
                 Pathology Unit-01 · READY</div>
         </div>""", unsafe_allow_html=True)
     else:
-        r   = st.session_state.pred
-        pct = r["confidence"] * 100
-        col = (var := lambda n: f"var(--{n})")(
-            "red" if r["is_malignant"] else
-            "amber" if r["uncertain"] else "green")
-        banner_cls = ("banner-mal" if r["is_malignant"] else
-                      "banner-unc" if r["uncertain"] else "banner-ben")
-        bar_cls    = ("bar-mal" if r["is_malignant"] else
-                      "bar-unc" if r["uncertain"] else "bar-ben")
-        badge      = ("<span class='unc-badge'>⚠ Borderline · Expert Review</span>"
-                      if r["uncertain"] else "")
+        r = st.session_state.pred
+        # Safety validation: ensure pred is not None and has required keys
+        if r is None or not isinstance(r, dict):
+            st.error("Error: Invalid prediction object. Please try uploading again.")
+        else:
+            # Safe value extraction with defaults
+            confidence = r.get("confidence", 0)
+            is_malignant = r.get("is_malignant", False)
+            uncertain = r.get("uncertain", False)
+            report = r.get("report", "No report available")
+            
+            if confidence is None:
+                confidence = 0
+            
+            pct = confidence * 100
+            col = (var := lambda n: f"var(--{n})")(
+                "red" if is_malignant else
+                "amber" if uncertain else "green")
+            banner_cls = ("banner-mal" if is_malignant else
+                          "banner-unc" if uncertain else "banner-ben")
+            bar_cls    = ("bar-mal" if is_malignant else
+                          "bar-unc" if uncertain else "bar-ben")
+            badge      = ("<span class='unc-badge'>⚠ Borderline · Expert Review</span>"
+                          if uncertain else "")
 
-        st.markdown(f"""
-        <div class="cv-card">
-            <div class="section-label">Diagnostic Result</div>
+            st.markdown(f"""
+            <div class="cv-card">
+                <div class="section-label">Diagnostic Result</div>
 
-            <div class="nova-block">
-                <div class="nova-block-label">Nova Clinical Synthesis</div>
-                <div class="nova-block-text">{r['report']}</div>
+                <div class="nova-block">
+                    <div class="nova-block-label">Nova Clinical Synthesis</div>
+                    <div class="nova-block-text">{report}</div>
+                </div>
             </div>
-        </div>
-        """, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
+
+
+# ── BATCH DETAILED RESULTS ────────────────────────────────────────────────────
+if st.session_state.batch_done and st.session_state.batch_result:
+    st.markdown("<div style='height:1.5rem'></div>", unsafe_allow_html=True)
+    
+    st.markdown("""
+    <div style="border-top:2px solid var(--border);padding:1.6rem 0 0;"></div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown(f"""
+    <div style="padding:1.8rem 0 1.4rem;">
+        <div style="font-size:1.6rem;font-weight:900;color:var(--text-1);">Individual Results</div>
+        <div style="font-family:var(--font-mono);font-size:0.65rem;
+             color:var(--text-3);letter-spacing:2px;text-transform:uppercase;margin-top:0.3rem;">
+            Specimen-by-specimen predictions and heatmaps</div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    br = st.session_state.batch_result
+    
+    # Create tabs for each image
+    if br['success_count'] > 0:
+        # Create dynamic tabs - one per successful image
+        tab_list = []
+        for i, result in enumerate(br['results']):
+            if result['status'] == 'success':
+                tab_list.append(f"🖼 {i+1}. {result['file_name'][:20]}")
+        
+        if tab_list:
+            result_tabs = st.tabs(tab_list)
+            
+            tab_idx = 0
+            for i, result in enumerate(br['results']):
+                # Safety validation: ensure result is not None and has required keys
+                if (result is not None and isinstance(result, dict) and 
+                    'status' in result and result['status'] == 'success' and 
+                    tab_idx < len(result_tabs) and 
+                    'confidence' in result and result['confidence'] is not None):
+                    
+                    with result_tabs[tab_idx]:
+                        st.markdown('<div class="cv-card">', unsafe_allow_html=True)
+                        
+                        # Image info header
+                        pred_color = "var(--red)" if result.get('label', 'UNKNOWN') == "MALIGNANT" else "var(--green)"
+                        st.markdown(f"""
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
+                            <div>
+                                <div style="font-family:var(--font-mono);font-size:0.65rem;color:var(--text-3);letter-spacing:1px;">SPECIMEN</div>
+                                <div style="font-size:1.2rem;font-weight:700;color:var(--text-1);">{result.get('file_name', 'Unknown')}</div>
+                            </div>
+                            <div style="text-align:right;">
+                                <div style="font-family:var(--font-mono);font-size:0.65rem;color:var(--text-3);letter-spacing:1px;">PREDICTION</div>
+                                <div style="font-size:1.2rem;font-weight:700;color:{pred_color};">{result.get('label', 'UNKNOWN')}</div>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        # Image preview and metadata
+                        col_img, col_meta = st.columns([1, 0.7])
+                        
+                        with col_img:
+                            st.markdown('<div style="border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden;">',
+                                       unsafe_allow_html=True)
+                            if 'pil_img' in result:
+                                st.image(result['pil_img'], use_container_width=True)
+                            st.markdown('</div>', unsafe_allow_html=True)
+                        
+                        with col_meta:
+                            conf_pct = (result.get('confidence', 0) * 100) if result.get('confidence') is not None else 0
+                            raw_score = result.get('raw_pred', 0.0)
+                            is_uncertain = result.get('uncertain', False)
+                            st.markdown(f"""
+                            <div style="padding:0.5rem;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);">
+                                <div style="font-family:var(--font-mono);font-size:0.6rem;color:var(--text-3);margin-bottom:0.5rem;letter-spacing:1px;">METRICS</div>
+                                <div style="font-size:0.95rem;line-height:2;color:var(--text-1);">
+                                    <div><span style="color:var(--text-3);">Confidence:</span> <strong>{conf_pct:.1f}%</strong></div>
+                                    <div><span style="color:var(--text-3);">Raw Score:</span> <strong>{raw_score:.4f}</strong></div>
+                                    <div><span style="color:var(--text-3);">Status:</span> <strong>{'Borderline' if is_uncertain else 'Confident'}</strong></div>
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                        # Grad-CAM heatmap
+                        st.markdown('<div style="margin-top:1rem;border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden;">',
+                                   unsafe_allow_html=True)
+                        if 'figure' in result:
+                            st.image(result['figure'], use_container_width=True)
+                        st.markdown('</div>', unsafe_allow_html=True)
+                        
+                        st.markdown('</div>', unsafe_allow_html=True)
+                        tab_idx += 1
+    
+    # Show errors if any
+    if br['error_count'] > 0:
+        st.markdown("<div style='height:0.8rem'></div>", unsafe_allow_html=True)
+        with st.expander(f"⚠ {br['error_count']} Image(s) Failed to Process", expanded=False):
+            for result in br['results']:
+                # Safety validation before accessing error result
+                if (result is not None and isinstance(result, dict) and 
+                    'status' in result and result['status'] == 'error'):
+                    file_name = result.get('file_name', 'Unknown')
+                    error_msg = result.get('error_msg', 'Unknown error')
+                    st.error(f"❌ **{file_name}**: {error_msg[:100]}")
 
 
 # ── TABBED LOWER SECTION ───────────────────────────────────────────────────────
@@ -1037,7 +1324,11 @@ if st.session_state.done:
         st.markdown('<div class="cv-card">', unsafe_allow_html=True)
         st.markdown('<div class="section-label">Neural ROI Heatmap · Grad-CAM XAI</div>',
                     unsafe_allow_html=True)
-        st.image(st.session_state.pred["figure"], use_container_width=True)
+        # Safe access to pred figure
+        if (st.session_state.pred is not None and 
+            isinstance(st.session_state.pred, dict) and 
+            'figure' in st.session_state.pred):
+            st.image(st.session_state.pred["figure"], use_container_width=True)
         st.markdown(f"""
         <div style="display:flex;gap:1.5rem;margin-top:0.75rem;
              font-family:var(--font-mono);font-size:0.6rem;color:var(--text-3);">
@@ -1059,22 +1350,29 @@ if st.session_state.done:
         if st.button("✦  Generate Morphological Breakdown"):
             with st.spinner("Nova Vision analysing cellular architecture…"):
                 r = st.session_state.pred
-                st.session_state.insight = call_nova(
-                    f"Specimen classified as {r['label']} "
-                    f"({r['confidence']*100:.1f}% confidence, "
-                    f"raw malignancy score: {r['raw_pred']:.4f}). "
-                    "Provide a structured expert morphological breakdown using these headings: "
-                    "1) Cell Density & Arrangement "
-                    "2) Nuclear Pleomorphism & Chromatin "
-                    "3) Gland/Duct Formation "
-                    "4) Mitotic Figures "
-                    "5) Stromal Changes. "
-                    "Under 200 words. Clinical, precise tone.",
-                    system="You are a senior breast pathologist AI assistant. "
-                           "Provide rigorous morphological analysis. "
-                           "Never make a definitive diagnosis.",
-                    image_b64=r["b64"]
-                )
+                # Safe extraction of prediction values with defaults
+                if r is not None and isinstance(r, dict):
+                    label = r.get('label', 'UNKNOWN')
+                    confidence = r.get('confidence', 0)
+                    raw_pred = r.get('raw_pred', 0.0)
+                    b64 = r.get("b64", "")
+                    
+                    st.session_state.insight = call_nova(
+                        f"Specimen classified as {label} "
+                        f"({confidence*100:.1f}% confidence, "
+                        f"raw malignancy score: {raw_pred:.4f}). "
+                        "Provide a structured expert morphological breakdown using these headings: "
+                        "1) Cell Density & Arrangement "
+                        "2) Nuclear Pleomorphism & Chromatin "
+                        "3) Gland/Duct Formation "
+                        "4) Mitotic Figures "
+                        "5) Stromal Changes. "
+                        "Under 200 words. Clinical, precise tone.",
+                        system="You are a senior breast pathologist AI assistant. "
+                               "Provide rigorous morphological analysis. "
+                               "Never make a definitive diagnosis.",
+                        image_b64=b64
+                    )
 
         if st.session_state.insight:
             st.markdown(
@@ -1107,16 +1405,23 @@ if st.session_state.done:
         if q := st.chat_input("Query Nova about this specimen…"):
             st.session_state.chat.append({"role": "user", "content": q})
             r = st.session_state.pred
-            reply = call_nova(
-                f"Case: {r['label']} | Confidence: {r['confidence']*100:.1f}% | "
-                f"P(malignant): {r['raw_pred']:.4f} | "
-                f"Borderline: {'Yes' if r['uncertain'] else 'No'}\n\n"
-                f"Clinician question: {q}",
-                system="You are a clinical AI diagnostic assistant supporting "
-                       "pathologists. Answer concisely. Never diagnose definitively."
-            )
-            st.session_state.chat.append({"role": "assistant", "content": reply})
-            st.rerun()
+            # Safe value extraction
+            if r is not None and isinstance(r, dict):
+                label = r.get('label', 'UNKNOWN')
+                confidence = r.get('confidence', 0)
+                raw_pred = r.get('raw_pred', 0.0)
+                is_uncertain = r.get('uncertain', False)
+                
+                reply = call_nova(
+                    f"Case: {label} | Confidence: {confidence*100:.1f}% | "
+                    f"P(malignant): {raw_pred:.4f} | "
+                    f"Borderline: {'Yes' if is_uncertain else 'No'}\n\n"
+                    f"Clinician question: {q}",
+                    system="You are a clinical AI diagnostic assistant supporting "
+                           "pathologists. Answer concisely. Never diagnose definitively."
+                )
+                st.session_state.chat.append({"role": "assistant", "content": reply})
+                st.rerun()
 
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1128,20 +1433,33 @@ if st.session_state.done:
         
         r = st.session_state.pred
         
+        # Safe value extraction with defaults
+        if r is not None and isinstance(r, dict):
+            label = r.get('label', 'UNKNOWN')
+            confidence = r.get('confidence', 0)
+            raw_pred = r.get('raw_pred', 0.0)
+            is_uncertain = r.get('uncertain', False)
+        else:
+            label = 'UNKNOWN'
+            confidence = 0
+            raw_pred = 0.0
+            is_uncertain = False
+        
         # Confidence and Diagnosis Scores
         col_d1, col_d2 = st.columns(2)
         with col_d1:
             st.markdown(f"""
             <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:1rem;margin-bottom:0.5rem;">
                 <div style="font-family:var(--font-mono);font-size:0.65rem;color:var(--amber);margin-bottom:0.3rem;letter-spacing:2px;">CONFIDENCE SCORE</div>
-                <div style="font-size:2.2rem;font-weight:900;color:var(--amber);line-height:1;letter-spacing:-0.02em;">{r['confidence']*100:.1f}%</div>
+                <div style="font-size:2.2rem;font-weight:900;color:var(--amber);line-height:1;letter-spacing:-0.02em;">{confidence*100:.1f}%</div>
                 <div style="font-family:var(--font-mono);font-size:0.6rem;color:var(--text-3);margin-top:0.3rem;">CNN Probability</div>
             </div>
             """, unsafe_allow_html=True)
         
         with col_d2:
-            pred_label = "MALIGNANT" if r["is_malignant"] else "BENIGN"
-            pred_color = "var(--red)" if r["is_malignant"] else "var(--green)"
+            is_malignant = r.get('is_malignant', False) if r is not None and isinstance(r, dict) else False
+            pred_label = "MALIGNANT" if is_malignant else "BENIGN"
+            pred_color = "var(--red)" if is_malignant else "var(--green)"
             st.markdown(f"""
             <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:1rem;margin-bottom:0.5rem;">
                 <div style="font-family:var(--font-mono);font-size:0.65rem;color:var(--blue);margin-bottom:0.3rem;letter-spacing:2px;">CLASSIFICATION</div>
@@ -1160,8 +1478,8 @@ if st.session_state.done:
                 <strong>Input Size:</strong> 96×96 pixels (Histopathology)<br/>
                 <strong>Analysis Type:</strong> Binary Classification (Benign vs Malignant)<br/>
                 <strong>Confidence Threshold:</strong> {threshold:.2f}<br/>
-                <strong>Raw Prediction:</strong> {r['raw_pred']:.4f}<br/>
-                <strong>Heatmap Colormap:</strong> HOT (Black→Red→Yellow for IDC malignancy visualization)
+                <strong>Raw Prediction:</strong> {raw_pred:.4f}<br/>
+                <strong>Heatmap Colormap:</strong> JET (Blue→Green→Yellow→Red for activation intensity)
             </div>
         </div>
         """, unsafe_allow_html=True)
