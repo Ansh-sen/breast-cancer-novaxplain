@@ -6,6 +6,7 @@ and exports them as downloadable PDF documents using ReportLab.
 """
 
 import io
+import json
 from datetime import datetime
 from typing import Dict, Optional, Any, Tuple
 from PIL import Image
@@ -50,18 +51,20 @@ def generate_medical_report(
         tumor_img: PIL Image of tumor localization (optional)
     
     Returns:
-        Tuple of (pdf_bytes, status_message):
+        Tuple of (pdf_bytes, json_string, status_message):
             - pdf_bytes: bytes object containing PDF or None if failed
+            - json_string: str containing JSON representation of report or None if failed
             - status_message: str describing success or error
     """
     
     if not REPORTLAB_AVAILABLE:
-        return None, "❌ ReportLab not installed. Install: pip install reportlab"
+        return None, None, "❌ ReportLab not installed. Install: pip install reportlab"
     
     try:
         # Extract data from result_dict
         prediction = result_dict.get('prediction', 'Unknown')
         confidence = result_dict.get('confidence', 0.0)
+        severity = result_dict.get('severity', 'Unknown Risk')
         cell_count = result_dict.get('cell_count', 0)
         cell_density = result_dict.get('cell_density', 0.0)
         irregular_ratio = result_dict.get('irregular_nuclei_ratio', 0.0)
@@ -143,6 +146,7 @@ def generate_medical_report(
         diag_data = [
             ["Prediction:", f"<b>{prediction}</b>"],
             ["Confidence Score:", f"<b>{confidence_pct}%</b>"],
+            ["Risk/Severity Level:", f"<b>{severity}</b>"],
             ["Specimen:", image_name],
             ["Analysis Date:", timestamp.split()[0]]
         ]
@@ -236,7 +240,52 @@ def generate_medical_report(
         story.append(Paragraph(morphology_interpretation, body_style))
         story.append(Spacer(1, 0.2*inch))
         
-        # 5. AI ASSESSMENT
+        # 5. WHOLE SLIDE TUMOR ANALYSIS (If available)
+        wsi_result = result_dict.get('wsi_result')
+        if wsi_result:
+            story.append(Paragraph("WHOLE SLIDE TUMOR ANALYSIS", section_style))
+            
+            wsi_text = (
+                f"Patch-based AI analysis detected {wsi_result['tumor_regions']} regions with elevated malignant probability. "
+                f"Approximately {wsi_result['tumor_percentage']}% of analyzed tissue patches exhibited suspicious characteristics."
+            )
+            story.append(Paragraph(wsi_text, body_style))
+            
+            wsi_data_list = [
+                ["Total Patches Analyzed:", f"{wsi_result['total_patches']}"],
+                ["Suspicious Tumor Patches:", f"{wsi_result['tumor_patches']}"],
+                ["Tumor Tissue Burden:", f"{wsi_result['tumor_percentage']}%"],
+                ["Distinct Tumor Regions:", f"{wsi_result['tumor_regions']}"],
+                ["Largest Region Size:", f"{wsi_result['largest_region']} patches"]
+            ]
+            
+            wsi_table = Table(wsi_data_list, colWidths=[2*inch, 3*inch])
+            wsi_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#ecf0f1')),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+                ('TOPPADDING', (0, 0), (-1, -1), 8),
+                ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#bdc3c7'))
+            ]))
+            story.append(wsi_table)
+            story.append(Spacer(1, 0.2*inch))
+            
+            # Add Heatmap if available
+            heatmap_img_wsi = wsi_result.get('heatmap_image')
+            if heatmap_img_wsi:
+                try:
+                    wsi_hm_buffer = _convert_pil_to_bytes(heatmap_img_wsi)
+                    story.append(Paragraph("<b>Whole Slide Image - Tumor Probability Field</b>", body_style))
+                    rl_wsi_img = RLImage(wsi_hm_buffer, width=4.5*inch, height=3*inch)
+                    story.append(rl_wsi_img)
+                    story.append(Spacer(1, 0.2*inch))
+                except Exception as e:
+                    print(f"Warning: Could not embed WSI heatmap: {str(e)}")
+                    
+        # 6. AI ASSESSMENT
         story.append(Paragraph("AI ASSESSMENT", section_style))
         
         ai_assessment = _generate_ai_assessment(
@@ -245,7 +294,7 @@ def generate_medical_report(
         story.append(Paragraph(ai_assessment, body_style))
         story.append(Spacer(1, 0.2*inch))
         
-        # 6. RECOMMENDATIONS & DISCLAIMER
+        # 7. RECOMMENDATIONS & DISCLAIMER
         story.append(Paragraph("RECOMMENDATIONS & DISCLAIMER", section_style))
         
         disclaimer_text = (
@@ -271,12 +320,44 @@ def generate_medical_report(
         doc.build(story)
         
         pdf_bytes = pdf_buffer.getvalue()
-        return pdf_bytes, "✅ Medical report generated successfully"
+        
+        # Generate JSON representation
+        json_data = {
+            "metadata": {
+                "report_generated": timestamp,
+                "model": "MobileNetV2 CNN",
+                "analysis_type": "Assisted Diagnosis"
+            },
+            "diagnostic_summary": {
+                "prediction": prediction,
+                "confidence_score": confidence_pct,
+                "risk_severity_level": severity,
+                "specimen": image_name,
+                "analysis_date": timestamp.split()[0]
+            },
+            "morphology_analysis": {
+                "cells_detected": cell_count,
+                "cell_density": cell_density,
+                "irregular_nuclei_ratio": irregular_pct,
+                "cell_clusters": cluster_count,
+                "largest_cluster": largest_cluster
+            }
+        }
+        
+        if wsi_result:
+            json_wsi = wsi_result.copy()
+            if "heatmap_image" in json_wsi:
+                del json_wsi["heatmap_image"]
+            json_data["wsi_analysis"] = json_wsi
+             
+        json_str = json.dumps(json_data, indent=4)
+        
+        return pdf_bytes, json_str, "✅ Medical report generated successfully"
         
     except Exception as e:
         error_msg = f"❌ Report generation failed: {str(e)}"
         print(error_msg)
-        return None, error_msg
+        return None, None, error_msg
 
 
 def _convert_pil_to_bytes(pil_image: Image.Image) -> io.BytesIO:

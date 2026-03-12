@@ -12,10 +12,11 @@ Handles:
 import numpy as np
 from typing import List, Dict, Tuple
 from PIL import Image
-from src.gradcam_utils import (load_and_preprocess_image,
+from analysis.gradcam import (load_and_preprocess_image,
                                 get_gradcam_heatmap,
                                 create_gradcam_figure,
                                 create_improved_gradcam_heatmap)
+from models.inference import safe_predict
 
 
 class BatchAnalyzer:
@@ -63,18 +64,20 @@ class BatchAnalyzer:
                 uploaded_file, self.img_size, self.model
             )
             
-            # Make prediction
-            raw_pred = float(self.model.predict(img_array, verbose=0)[0][0])
-            
-            # Classify based on threshold
-            label = "MALIGNANT" if raw_pred > self.threshold else "BENIGN"
-            confidence = raw_pred if label == "MALIGNANT" else 1.0 - raw_pred
+            # Use Error Safe Prediction
+            prediction_data = safe_predict(self.model, img_array, self.threshold)
+            if prediction_data["status"] != "success":
+                raise Exception("Model safe_predict returned failure")
+                
+            raw_pred = prediction_data["raw_pred"]
+            label = prediction_data["label"]
+            confidence = prediction_data["confidence"]
+            uncertain = prediction_data["uncertain"]
             
             # Generate heatmap
             heatmap = get_gradcam_heatmap(img_array, self.model)
             
             # Create visualization
-            uncertain = 0.40 < raw_pred < 0.60
             figure = create_gradcam_figure(
                 heatmap, pil_img, label, confidence, uncertain, self.img_size
             )
